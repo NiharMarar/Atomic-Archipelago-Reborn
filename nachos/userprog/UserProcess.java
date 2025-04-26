@@ -28,6 +28,13 @@ public class UserProcess {
 		pageTable = new TranslationEntry[numPhysPages];
 		for (int i = 0; i < numPhysPages; i++)
 			pageTable[i] = new TranslationEntry(i, i, true, false, false, false);
+
+		/* ─── Project-2: initialise per-process fd table ─── */
+		myFileSlots = new OpenFile[FD_TABLE_SIZE];
+		// fd 0 = stdin, fd 1 = stdout
+		myFileSlots[0] = UserKernel.console.openForReading();
+		myFileSlots[1] = UserKernel.console.openForWriting();
+		
 	}
 
 	/**
@@ -347,6 +354,76 @@ public class UserProcess {
 		processor.writeRegister(Processor.regA1, argv);
 	}
 
+
+	/* ─────────────────── Project-2 filesystem helpers ─────────────────── */
+
+	private int handleCreate(int vaddr)               { return handleOpenInternal(vaddr, true);  }
+	private int handleOpen  (int vaddr)               { return handleOpenInternal(vaddr, false); }
+
+	private int handleOpenInternal(int vaddr, boolean create) {
+		String name = readVirtualMemoryString(vaddr, 256);
+		if (name == null) return -1;
+
+		int slot = firstFreeFD();
+		if (slot == -1) return -1;
+
+		OpenFile f = ThreadedKernel.fileSystem.open(name, create);
+		if (f == null) return -1;
+
+		myFileSlots[slot] = f;
+		return slot;
+	}
+
+	private int handleClose(int fd) {
+		OpenFile f = getFile(fd);
+		if (f == null) return -1;
+		f.close();
+		myFileSlots[fd] = null;
+		return 0;
+	}
+
+	private int handleUnlink(int vaddr) {
+		String name = readVirtualMemoryString(vaddr, 256);
+		if (name == null) return -1;
+		return ThreadedKernel.fileSystem.remove(name) ? 0 : -1;
+	}
+
+	private int handleRead(int fd, int vaddr, int count) {
+		OpenFile f = getFile(fd);
+		if (f == null || count < 0) return -1;
+
+		byte[] temp = new byte[Processor.pageSize];
+		int total = 0;
+
+		while (count > 0) {
+			int chunk = Math.min(count, temp.length);
+			int n = f.read(temp, 0, chunk);
+			if (n <= 0) break;                         // EOF or error→0
+			if (writeVirtualMemory(vaddr, temp, 0, n) != n) return -1;
+			total += n; vaddr += n; count -= n;
+			if (n < chunk) break;                      // hit EOF
+		}
+		return total;
+	}
+
+	private int handleWrite(int fd, int vaddr, int count) {
+		OpenFile f = getFile(fd);
+		if (f == null || count < 0) return -1;
+
+		byte[] temp = new byte[Processor.pageSize];
+		int total = 0;
+
+		while (count > 0) {
+			int chunk = Math.min(count, temp.length);
+			int n = readVirtualMemory(vaddr, temp, 0, chunk);
+			if (n <= 0) return -1;                     // bad user buffer
+			if (f.write(temp, 0, n) != n) return -1;   // disk full/err
+			total += n; vaddr += n; count -= n;
+		}
+		return total;
+	}
+
+
 	/**
 	 * Handle the halt() system call.
 	 */
@@ -447,6 +524,20 @@ public class UserProcess {
 		case syscallExit:
 			return handleExit(a0);
 
+		case syscallCreate: 
+			return handleCreate(a0);
+		case syscallOpen:   
+			return handleOpen  (a0);
+		case syscallRead:   
+			return handleRead  (a0, a1, a2);
+		case syscallWrite:  
+			return handleWrite (a0, a1, a2);
+		case syscallClose:  
+			return handleClose (a0);
+		case syscallUnlink: 
+			return handleUnlink(a0);
+	
+
 		default:
 			Lib.debug(dbgProcess, "Unknown syscall " + syscall);
 			Lib.assertNotReached("Unknown system call!");
@@ -481,6 +572,34 @@ public class UserProcess {
 			Lib.assertNotReached("Unexpected exception");
 		}
 	}
+
+
+
+
+
+
+	/* ─────────────────────  Project-2 file-descriptor table  ─────────────────── */
+
+	private static final int FD_TABLE_SIZE = 16;          // every process ≤16 fd’s
+	private OpenFile[] myFileSlots;                       // index = file descriptor
+
+	/* helper: first free slot or –1 */
+	private int firstFreeFD() {
+		for (int i = 0; i < FD_TABLE_SIZE; i++)
+			if (myFileSlots[i] == null) return i;
+		return -1;
+	}
+
+	/* helper: validate fd and return OpenFile (or null on error) */
+	private OpenFile getFile(int fd) {
+		if (fd < 0 || fd >= FD_TABLE_SIZE) return null;
+		return myFileSlots[fd];
+	}
+
+
+
+
+
 
 	/** The program being run by this process. */
 	protected Coff coff;
